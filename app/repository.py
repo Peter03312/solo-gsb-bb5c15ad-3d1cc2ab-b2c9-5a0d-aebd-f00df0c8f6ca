@@ -7,11 +7,14 @@ from typing import Any
 
 from psycopg.errors import ExclusionViolation, UniqueViolation
 
+from . import disables
 from .errors import blocked, conflict, not_found
 
 # ---- 判定原因码 ----------------------------------------------------------------
 # 放行成功
 REASON_PASSED = "PASSED_CALIBRATION_COVERAGE"
+# 检测时间命中仪器“未撤销”禁用区间（即使校准通过也拒绝放行）
+REASON_INSTRUMENT_DISABLED = disables.REASON_DISABLED
 # 该仪器当前没有任何校准版本
 REASON_NO_CALIBRATION = "NO_CALIBRATION"
 # 存在当前校准版本，但检测时间不落在任何 [valid_from, valid_to) 内
@@ -214,6 +217,25 @@ def correct_calibration(conn, payload) -> tuple[dict[str, Any], list[dict[str, A
 # ---- 报告发布 ------------------------------------------------------------------
 
 def publish_report(conn, payload) -> dict[str, Any]:
+    # 禁用优先于校准：检测时间命中未撤销禁用区间时，即使当前校准通过也拒绝放行。
+    # 锁定命中的禁用行（未命中则锁该仪器全部未撤销事件），与并发的禁用
+    # 登记/撤销事务互斥；SERIALIZABLE 隔离保证两者判定可串行化。
+    hit_disable = disables.find_active_disable(
+        conn, payload.instrument, payload.tested_at, lock=True)
+    if hit_disable is not None:
+        dfrom, dto = hit_disable["disabled_from"], hit_disable["disabled_to"]
+        raise blocked(
+            REASON_INSTRUMENT_DISABLED,
+            f"仪器 {payload.instrument} 在检测时间 {payload.tested_at.isoformat()} "
+            f"处于禁用状态（事件号 {hit_disable['id']}，"
+            f"区间 [{dfrom.isoformat()}, "
+            f"{dto.isoformat() if dto else '开放'})，左闭右开）："
+            f"{hit_disable['reason']}",
+            instrument=payload.instrument,
+            tested_at=payload.tested_at.isoformat(),
+            disable_basis=disables.disable_brief(hit_disable),
+        )
+
     decision = determine(conn, payload.instrument, payload.tested_at, lock=True)
     basis = decision["calibration"]
     snapshot: dict[str, Any] = {
