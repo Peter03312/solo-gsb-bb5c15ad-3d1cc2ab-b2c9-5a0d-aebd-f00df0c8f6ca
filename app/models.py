@@ -43,6 +43,36 @@ class ReportSubmit(BaseModel):
     _normalize_tested = field_validator("tested_at")(lambda cls, v: as_utc(v))
 
 
+class DisableCreate(BaseModel):
+    event_no: str = Field(..., min_length=1, description="唯一禁用事件号（业务侧生成，撤销后也不可复用）")
+    instrument: str = Field(..., min_length=1, description="仪器标识")
+    disabled_from: datetime = Field(..., description="禁用起点（含）")
+    disabled_to: datetime | None = Field(None, description="禁用终点（不含）；为空表示持续禁用")
+    reason: str = Field(..., min_length=1, description="禁用原因（如故障说明）")
+
+    _normalize_from = field_validator("disabled_from")(lambda cls, v: as_utc(v))
+    _normalize_to = field_validator("disabled_to")(lambda cls, v: as_utc(v) if v else v)
+
+
+class DisableRevoke(BaseModel):
+    reason: str | None = Field(None, description="撤销原因（可选）")
+
+
+def serialize_disable(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "event_no": row["event_no"],
+        "instrument": row["instrument"],
+        "disabled_from": row["disabled_from"].isoformat(),
+        "disabled_to": row["disabled_to"].isoformat() if row["disabled_to"] else None,
+        "reason": row["reason"],
+        "revoked": row["revoked"],
+        "revoked_at": row["revoked_at"].isoformat() if row["revoked_at"] else None,
+        "revoke_reason": row["revoke_reason"],
+        "created_at": row["created_at"].isoformat(),
+    }
+
+
 def serialize_calibration(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": row["id"],

@@ -79,6 +79,42 @@ def main() -> None:
     status, body = call("GET", "/calibrations?instrument=GC-02", None)
     show("该校准全部版本（旧版保留可查）", status, body)
 
+    # ---- 仪器禁用区间 ----
+    status, body = call("POST", "/disables", {
+        "event_no": "DIS-GC-2026-001",
+        "instrument": "GC-02",
+        "disabled_from": "2026-03-01T00:00:00Z",
+        "disabled_to": "2026-05-01T00:00:00Z",
+        "reason": "进样阀故障待修",
+    })
+    show("登记禁用区间（左闭右开，唯一事件号）", status, body)
+
+    status, body = call("POST", "/disables", {
+        "event_no": "DIS-GC-2026-002",
+        "instrument": "GC-02",
+        "disabled_from": "2026-04-01T00:00:00Z",
+        "disabled_to": "2026-04-10T00:00:00Z",
+        "reason": "重叠登记",
+    })
+    show("重叠禁用区间（应 409 DISABLE_INTERVAL_OVERLAP）", status, body)
+
+    status, body = call("POST", "/reports", {
+        "instrument": "GC-02",
+        "tested_at": "2026-03-15T08:00:00Z",
+        "reference": "GC-REP-2",
+    })
+    show("命中禁用区间发布（应 422 INSTRUMENT_DISABLED，含禁用依据）", status, body)
+
+    status, body = call("GET", "/disables/affected-reports?instrument=GC-02", None)
+    show("当前受禁用影响的已发布报告（原快照仍为放行）", status, body)
+
+    status, body = call("POST", "/disables/DIS-GC-2026-001/revoke",
+                        {"reason": "进样阀更换完成"})
+    show("按事件号撤销禁用（记录保留）", status, body)
+
+    status, body = call("GET", "/disables/affected-reports?instrument=GC-02", None)
+    show("撤销后受影响报告为空（原报告与快照不改写）", status, body)
+
 
 if __name__ == "__main__":
     main()

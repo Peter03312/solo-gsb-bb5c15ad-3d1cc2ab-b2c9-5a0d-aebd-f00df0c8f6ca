@@ -78,6 +78,49 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_report_reference
     ON reports (reference) WHERE reference IS NOT NULL;
 CREATE INDEX IF NOT EXISTS ix_report_instrument_tested
     ON reports (instrument, tested_at);
+
+-- 仪器禁用区间（校准合格后仪器仍可能因故障被禁用）。
+-- 撤销仅置 revoked = TRUE，记录保留供追溯。
+CREATE TABLE IF NOT EXISTS instrument_disable_events (
+    id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    event_no     TEXT        NOT NULL,             -- 业务唯一事件号
+    instrument   TEXT        NOT NULL,
+    disabled_from TIMESTAMPTZ NOT NULL,
+    disabled_to  TIMESTAMPTZ,                      -- NULL = 开放区间（禁用持续至今）
+    reason       TEXT        NOT NULL,
+    revoked      BOOLEAN     NOT NULL DEFAULT FALSE,
+    revoked_at   TIMESTAMPTZ,
+    revoke_reason TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT ck_disable_interval CHECK (
+        disabled_to IS NULL OR disabled_to > disabled_from
+    )
+);
+
+-- 事件号全局唯一（撤销后也不允许复用，审计可按事件号追溯）
+CREATE UNIQUE INDEX IF NOT EXISTS uq_disable_event_no
+    ON instrument_disable_events (event_no);
+
+-- 同仪器“未撤销”的禁用区间 [disabled_from, disabled_to) 不得重叠；
+-- 边界相接（前一区间终点 = 后一区间起点）允许；撤销行不参与约束。
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'excl_active_disable_interval'
+    ) THEN
+        ALTER TABLE instrument_disable_events
+            ADD CONSTRAINT excl_active_disable_interval
+            EXCLUDE USING gist (
+                instrument WITH =,
+                tstzrange(disabled_from, disabled_to, '[)') WITH &&
+            ) WHERE (NOT revoked);
+    END IF;
+END $$;
+
+-- 发布判定按 instrument + 时点命中未撤销区间
+CREATE INDEX IF NOT EXISTS ix_disable_active_lookup
+    ON instrument_disable_events (instrument, disabled_from, disabled_to)
+    WHERE NOT revoked;
 """
 
 
@@ -119,3 +162,16 @@ def init_db() -> None:
     assert pool is not None
     with pool.connection() as conn:
         conn.execute(DDL)
+
+
+def instrument_lock_key(instrument: str) -> tuple[int, int]:
+    """仪器级会话咨询锁键 (命名空间, hashtext(instrument))；事务外调用。
+
+    同仪器的“禁用登记 / 撤销 / 报告发布”据此严格串行（见 transactions.run_tx）。
+    """
+    from .repository import ADVISORY_LOCK_NS
+
+    assert pool is not None
+    with pool.connection() as conn:
+        row = conn.execute("SELECT hashtext(%s) AS h", (instrument,)).fetchone()
+    return ADVISORY_LOCK_NS, row["h"]

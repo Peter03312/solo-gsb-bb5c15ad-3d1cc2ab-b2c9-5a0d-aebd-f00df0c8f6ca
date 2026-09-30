@@ -1,7 +1,7 @@
 # 实验室检测报告放行服务
 
-基于 **Python + FastAPI + PostgreSQL** 的 HTTP API：管理仪器校准记录（含有效期、通过/未通过结论、更正版本链），
-并据此对检测报告做放行判定。
+基于 **Python + FastAPI + PostgreSQL** 的 HTTP API：管理仪器校准记录（含有效期、通过/未通过结论、更正版本链）、
+仪器禁用区间（故障停用与撤销追溯），并据此对检测报告做放行判定。
 
 ## 核心规则
 
@@ -10,12 +10,21 @@
 - 更正必须**引用原记录**（任意历史版本 ID）并提交**连续版本号**（当前最新版 + 1）。
 - 旧版本全部保留可查，`is_current=true` 的唯一最新版才参与判定。
 - 版本冲突、区间冲突一律拒绝（`409`），错误体含机器可读原因码。
-- 报告放行条件：提交的检测时间被该仪器一条**结论为通过**的**当前**校准版本覆盖；
-  成功时返回所据校准版本，并保存发布时判定快照。
+- 仪器校准合格后仍可能因故障被禁用：按**唯一事件号**登记禁用区间
+  `[disabled_from, disabled_to)`（终点可空表示持续禁用），同仪器**未撤销**区间不得重叠
+  （边界相接允许），同样由 GiST `EXCLUDE` 约束强制。
+- 可按事件号**撤销**禁用；撤销仅置标记并记录时间/原因，原记录保留供追溯；事件号撤销后也不可复用。
+- 报告放行条件：提交的检测时间**先**检查禁用区间——命中任一**未撤销**禁用区间即拒绝放行（`422`）
+  并返回禁用依据（事件号、区间、原因），**即使当前校准通过**；未命中禁用时再沿用校准判定
+  （被一条结论为通过的当前校准版本覆盖才放行）。
+- 成功放行时返回所据校准版本，并保存发布时判定快照。
 - 校准缺失 / 时间在区间外 / 校准未通过：拒绝放行（`422`），返回阻断原因码与说明。
 - 已发布报告的快照**永不改写**；更正校准后可按当前有效性重算，列出结论与快照不同的报告。
-- 更正与发布事务均运行在 **SERIALIZABLE** 隔离级别并对冲突自动重试，
-  配合唯一部分索引与行锁，杜绝“双最新版”和“依据过期校准放行”。
+- 可按**当前禁用状态**查询受影响的已发布报告及对应禁用依据；追溯登记或撤销禁用后结果随之变化，
+  但原放行记录与快照不改写。
+- 禁用变更、校准更正与报告发布事务均运行在 **SERIALIZABLE** 隔离级别并对冲突自动重试，
+  配合唯一部分索引、GiST 排他约束与行锁，杜绝“双最新版”、“禁用区间重叠”和
+  “在已生效禁用区间内误放行”。
 
 ## 一键启动
 
@@ -80,10 +89,20 @@ uvicorn app.main:app --reload
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/reports` | 提交报告并判定放行 |
+| POST | `/reports` | 提交报告并判定放行（禁用判定优先于校准判定） |
 | GET | `/reports?instrument=` | 已发布报告列表（含不可变快照） |
 | GET | `/reports/{id}` | 单条报告 |
 | GET | `/reports/drift/recompute` | 同上，重算漂移 |
+
+### 仪器禁用（本轮新增）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/disables` | 按唯一事件号登记禁用区间（左闭右开，终点可空） |
+| POST | `/disables/{event_no}/revoke` | 按事件号撤销禁用（记录保留） |
+| GET | `/disables?instrument=&include_revoked=` | 禁用事件列表（默认含已撤销，供追溯） |
+| GET | `/disables/{event_no}` | 按事件号查看单条禁用事件（含已撤销） |
+| GET | `/disables/affected-reports?instrument=` | 当前受禁用影响的已发布报告及禁用依据 |
 
 ## 调用示例
 
@@ -149,9 +168,11 @@ curl -sS -X POST http://localhost:8000/reports \
 
 阻断场景（`422`，不落库）的 `detail.code`：
 
-- `NO_CALIBRATION` —— 该仪器当前没有任何校准；
-- `OUTSIDE_VALID_PERIOD` —— 有校准但检测时间不在任何左闭右开区间内（如恰等于 `valid_to`）；
-- `CALIBRATION_NOT_PASSED` —— 覆盖该时点的校准结论为“未通过”。
+- `INSTRUMENT_DISABLED` —— 检测时间命中该仪器**未撤销**禁用区间（优先于一切校准判定），
+  `detail.disable` 给出禁用依据（`event_no`/区间/`reason`）；
+- `NO_CALIBRATION` —— 未命中禁用，且该仪器当前没有任何校准；
+- `OUTSIDE_VALID_PERIOD` —— 未命中禁用，有校准但检测时间不在任何左闭右开区间内（如恰等于 `valid_to`）；
+- `CALIBRATION_NOT_PASSED` —— 未命中禁用，覆盖该时点的校准结论为“未通过”。
 
 ### 3. 更正校准（连续版本号 + 引用原记录）
 
@@ -185,11 +206,134 @@ curl -sS 'http://localhost:8000/calibrations/drift/recompute?instrument=HPLC-01'
 - `NOW_COVERED_BY_OTHER_VERSION` —— 仍放行，但所据校准版本已变化；
 - `NOW_RELEASEABLE` —— 快照阻断、当前可放行（历史阻断报告原本不落库，属防御性取值）。
 
+### 5. 登记禁用区间
+
+```bash
+curl -sS -X POST http://localhost:8000/disables \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "event_no": "DIS-2026-001",
+        "instrument": "HPLC-01",
+        "disabled_from": "2026-03-01T00:00:00Z",
+        "disabled_to":   "2026-05-01T00:00:00Z",
+        "reason": "进样阀故障待修"
+      }'
+```
+
+返回（`201`，`disabled_to` 为 `null` 表示持续禁用）：
+
+```json
+{
+  "disable_event": {
+    "id": 1,
+    "event_no": "DIS-2026-001",
+    "instrument": "HPLC-01",
+    "disabled_from": "2026-03-01T00:00:00+00:00",
+    "disabled_to": "2026-05-01T00:00:00+00:00",
+    "reason": "进样阀故障待修",
+    "revoked": false,
+    "revoked_at": null,
+    "revoke_reason": null,
+    "created_at": "2026-09-30T00:00:00+00:00"
+  }
+}
+```
+
+拒绝约定：
+
+- 区间无效（`disabled_to <= disabled_from`）：`422 {"detail": {"code": "INVALID_INTERVAL"}}`；
+- 事件号重复（**含已撤销事件**，事件号不可复用）：
+  `409 {"detail": {"code": "DISABLE_EVENT_EXISTS"}}`；
+- 与同仪器另一条**未撤销**区间重叠：
+  `409 {"detail": {"code": "DISABLE_INTERVAL_OVERLAP"}}`；边界相接（前区间终点 = 后区间起点）允许。
+
+### 6. 命中禁用区间时提交报告（即使校准通过也拒绝）
+
+```bash
+curl -sS -X POST http://localhost:8000/reports \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "instrument": "HPLC-01",
+        "tested_at": "2026-03-15T08:00:00Z",
+        "reference": "R-2026-0009"
+      }'
+```
+
+`422` 响应（阻断报告不落库，`disable` 即禁用依据；左闭右开，恰为 `disabled_to` 时不命中）：
+
+```json
+{
+  "detail": {
+    "code": "INSTRUMENT_DISABLED",
+    "message": "检测时间 2026-03-15T08:00:00+00:00 命中仪器 HPLC-01 的未撤销禁用区间（事件 DIS-2026-001）：进样阀故障待修",
+    "instrument": "HPLC-01",
+    "tested_at": "2026-03-15T08:00:00+00:00",
+    "disable": {
+      "event_no": "DIS-2026-001",
+      "instrument": "HPLC-01",
+      "disabled_from": "2026-03-01T00:00:00+00:00",
+      "disabled_to": "2026-05-01T00:00:00+00:00",
+      "reason": "进样阀故障待修"
+    }
+  }
+}
+```
+
+未命中禁用区间时，请求体、成功响应与原有 `NO_CALIBRATION` / `OUTSIDE_VALID_PERIOD` /
+`CALIBRATION_NOT_PASSED` 错误约定完全不变（校准判定与快照格式保持兼容）。
+
+### 7. 撤销禁用与追溯查询
+
+```bash
+# 按事件号撤销（未知事件 404 NOT_FOUND；重复撤销 409 DISABLE_ALREADY_REVOKED）
+curl -sS -X POST http://localhost:8000/disables/DIS-2026-001/revoke \
+  -H 'Content-Type: application/json' -d '{"reason": "进样阀更换完成"}'
+
+# 事件记录保留，仍可按事件号/列表追溯（列表默认含已撤销）
+curl -sS http://localhost:8000/disables/DIS-2026-001
+curl -sS 'http://localhost:8000/disables?instrument=HPLC-01&include_revoked=true'
+```
+
+撤销后该区间不再参与放行判定，同一检测时间即可按校准规则正常放行。
+
+### 8. 按当前禁用状态查询受影响的已发布报告
+
+```bash
+curl -sS 'http://localhost:8000/disables/affected-reports?instrument=HPLC-01'
+```
+
+返回当前检测时间命中未撤销禁用区间的**已发布**报告及对应禁用依据；
+追溯登记一条禁用区间后，历史已放行报告可立即出现在结果中；撤销后随即消失。
+原放行记录与发布时快照永不改写（结果中的 `snapshot` 仍记录当时的放行结论）：
+
+```json
+{
+  "items": [
+    {
+      "report_id": 1,
+      "reference": "R-2026-0001",
+      "instrument": "HPLC-01",
+      "tested_at": "2026-03-15T08:00:00+00:00",
+      "basis_calibration_id": 1,
+      "snapshot": {"released": true, "reason_code": "PASSED_CALIBRATION_COVERAGE", "...": "..."},
+      "disable": {
+        "event_no": "DIS-2026-001",
+        "instrument": "HPLC-01",
+        "disabled_from": "2026-03-01T00:00:00+00:00",
+        "disabled_to": "2026-05-01T00:00:00+00:00",
+        "reason": "进样阀故障待修"
+      }
+    }
+  ],
+  "count": 1
+}
+```
+
 ### 脚本化完整演示
 
 ```bash
-bash examples/curl-demo.sh                     # curl 版全流程
-BASE_URL=http://localhost:8000 python3 examples/demo.py   # 含并发更正的 Python 版
+bash examples/curl-demo.sh                     # curl 版全流程（含禁用登记/撤销）
+BASE_URL=http://localhost:8000 python3 examples/demo.py   # 含并发更正与禁用流程的 Python 版
 ```
 
 ## 并发正确性如何保证
@@ -198,9 +342,20 @@ BASE_URL=http://localhost:8000 python3 examples/demo.py   # 含并发更正的 P
    - 唯一部分索引 `uq_calibration_one_current ON (chain_id) WHERE is_current`；
    - 更正先锁版本链行（`SELECT … FOR UPDATE`），再“旧版下线 + 新版插入”，同链并发更正天然串行；
    - 版本号非连续（基于过期版本提交）返回 `409 VERSION_CONFLICT`。
-2. **当前区间不会重叠**：GiST 排他约束
+2. **当前校准区间不会重叠**：GiST 排他约束
    `EXCLUDE (instrument WITH =, tstzrange(valid_from, valid_to, '[)') WITH &&) WHERE (is_current)`，
    对并发插入同样生效，冲突映射为 `409 INTERVAL_OVERLAP`。
 3. **不会依据过期校准放行**：发布与更正均为 SERIALIZABLE 事务；
    发布时锁定该仪器当前校准行（覆盖行 `FOR UPDATE`，无覆盖时锁全部当前行），
    与“下线旧版”的更正事务互斥；若重试后仍冲突，返回 `409 TRANSACTION_CONFLICT` 而非脏放行。
+4. **未撤销禁用区间不会重叠**：事件号有全局唯一索引（撤销后也不可复用）；
+   GiST 排他约束
+   `EXCLUDE (instrument WITH =, tstzrange(disabled_from, disabled_to, '[)') WITH &&) WHERE (NOT revoked)`
+   对并发登记生效，冲突映射为 `409 DISABLE_INTERVAL_OVERLAP`，边界相接允许。
+5. **不会在已生效禁用区间内误放行**：发布、登记禁用、撤销禁用均为 SERIALIZABLE 事务。
+   发布时先锁定命中的未撤销禁用行（未命中则锁该仪器全部未撤销禁用行），
+   与登记/撤销事务互斥；任一事务以串行化失败告终都会整体重试，
+   重试后仍冲突返回 `409 TRANSACTION_CONFLICT`，绝不放行。撤销按事件号行锁串行，
+   未知事件 `404`、重复撤销 `409 DISABLE_ALREADY_REVOKED`。
+6. **追溯一致**：受影响报告查询为 SERIALIZABLE 只读事务，按当前未撤销禁用区间实时计算，
+   不物化、不改写报告与快照；登记/撤销的结果对之后的查询立即可见。

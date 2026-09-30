@@ -30,13 +30,17 @@ def _serialize_report(row: dict) -> dict:
 def submit_report(payload: ReportSubmit):
     """提交检测报告并尝试放行。
 
-    放行条件：检测时间被该仪器一条“结论为通过”的当前校准版本覆盖
-    （区间左闭右开，仅最新版参与判定）。
+    判定顺序：先检查仪器禁用区间（命中未撤销区间即 422 INSTRUMENT_DISABLED
+    并返回禁用依据，即使校准通过）；再检查校准——检测时间被该仪器一条“结论
+    为通过”的当前校准版本覆盖才放行（左闭右开，仅最新版参与判定）。
 
     - 放行：201，返回所据校准版本及不可变判定快照
-    - 缺失校准 / 区间外 / 校准未通过：422，detail 内含阻断原因码与说明
+    - 命中禁用 / 缺失校准 / 区间外 / 校准未通过：422，detail 内含阻断原因码与说明
     """
-    return run_tx(lambda conn: publish_report(conn, payload))
+    return run_tx(
+        lambda conn: publish_report(conn, payload),
+        advisory_lock=db.instrument_lock_key(payload.instrument),
+    )
 
 
 # 注意：静态路由需在 /{report_id} 之前声明
